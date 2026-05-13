@@ -111,7 +111,7 @@ UI_PHASE_MODE: str = "REFRESH_ALL"
 # This affects DEMO_URL and which login-element waiter is used. When
 # LETS_TALK_MODE is "DEFAULT" (recommended), this also picks the right
 # Let's-talk click behavior (STAGING → NEVER, DEV → ALWAYS).
-BOT_ENVIRONMENT: str = "STAGING"
+BOT_ENVIRONMENT: str = "DEV"
 
 # When True, the script runs STAGING first against TEST_SHEET_STAGING_XLSX,
 # then clears the queries.xlsx D/E columns (so DEV captures fresh IDs),
@@ -131,7 +131,7 @@ RUN_BOTH_ENVIRONMENTS: bool = False
 #   "opera"    → Real Opera via executable_path.
 BROWSER: str = "chrome"
 OPERA_EXEC_PATH: str = "/Applications/Opera.app/Contents/MacOS/Opera"
-HEADLESS: bool = False
+HEADLESS: bool = True
 HUMAN_LIKE: bool = True
 FULL_SCREEN_VIEWPORT: dict = {"width": 1920, "height": 1080}
 
@@ -161,8 +161,8 @@ LETS_TALK_MODE: str = "DEFAULT"
 #               (multi-turn conversation order is preserved); parallelism is
 #               at the TestID level.
 # MAX_WORKERS:  hard safety cap clamped onto both worker counts.
-UI_WORKERS: int = 5
-API_WORKERS: int = 5
+UI_WORKERS: int = 1
+API_WORKERS: int = 1
 MAX_WORKERS: int = 50
 
 # ---------- UI ↔ API PIPELINING ----------
@@ -175,7 +175,7 @@ MAX_WORKERS: int = 50
 #                   This pipelines the two phases so you don't have to wait
 #                   for all UI to finish before any API begins. With
 #                   UI_WORKERS=1, "batch" means a single row.
-PARALLEL_PROCESSING: bool = False
+PARALLEL_PROCESSING: bool = True
 
 # ---------- UI RETRY / TIMEOUT TUNING ----------
 # Attempts per query within one pass over the rows.
@@ -191,6 +191,34 @@ CONV_ID_WAIT_S: int = 30
 INTER_PASS_DELAY_S: float = 2.0
 # Backoff base for inner attempt retries. Sleep between attempts = base * attempt_number.
 RETRY_BACKOFF_BASE_S: float = 1.5
+
+# After typing the user's query and pressing Enter, the bot is supposed to
+# reply with a login card (STAGING) or a login link (DEV). If that response
+# doesn't appear within LOGIN_LINK_WAIT_TIMEOUT_S, we re-send the same
+# query up to LOGIN_LINK_QUERY_RETRIES times before failing the row.
+# Total time budget for this step ≈ (RETRIES + 1) * WAIT_TIMEOUT_S.
+#
+# LOGIN_LINK_POLL_INTERVAL_S is how often the script re-checks the chat
+# frame for a login element while waiting. The wait is a continuous polling
+# loop — every poll interval, all login-target candidate selectors are
+# checked. Lower value = catches the element faster once it appears (so we
+# click and proceed sooner), at the cost of slightly more CPU. 2s is a
+# good balance for a Vue widget.
+#
+# Re-sends happen IMMEDIATELY when the per-attempt wait window elapses, with
+# no extra sleep — polling continues right up until the moment of re-send,
+# so a slow bot reply never gets missed in the gap.
+LOGIN_LINK_WAIT_TIMEOUT_S: int = 25
+LOGIN_LINK_QUERY_RETRIES: int = 3
+LOGIN_LINK_POLL_INTERVAL_S: float = 2.0
+
+# When True, save a full-page PNG screenshot of the browser context whenever
+# an attempt of process_query fails. Lets you see exactly what state the
+# widget was in at the moment of breakage. Files land in UI_SCREENSHOT_DIR
+# (created automatically if missing). Filenames include row, login_id,
+# attempt number, and a timestamp for uniqueness.
+UI_SCREENSHOT_ON_FAILURE: bool = True
+UI_SCREENSHOT_DIR: str = "ui_error_screenshots"
 
 # ---------- OTP / MAILINATOR ----------
 # Two ways to gate "is this OTP fresh enough":
@@ -226,8 +254,8 @@ API_TURN_TIMEOUT_S: float = 60.0
 # Delay between sequential turns of one TestID. Set 0 to disable.
 API_INTER_TURN_DELAY_S: float = 0.5
 # GET polling inside one turn: max attempts (suffix flips each attempt) and delay.
-API_GET_MAX_ATTEMPTS: int = 15
-API_GET_RETRY_DELAY_S: float = 2.0
+API_GET_MAX_ATTEMPTS: int = 20
+API_GET_RETRY_DELAY_S: float = 5.0
 
 # When True, after the main pipeline finishes (UI + API, whether sequential or
 # pipelined), the script does ONE more pass that rescans the test sheet for
@@ -793,6 +821,125 @@ async def wait_for_login_success(chat_frame, timeout_ms: int = 30000) -> None:
     )
 
 
+def _login_target_candidates():
+    """
+    Return the ordered list of locator-builders that wait_for_login_target /
+    poll_for_login_target use. Defined as a function (not a module constant)
+    because the regexes need fresh re.compile per call to keep them
+    re-entrant — callers iterate this multiple times.
+    """
+    login_re_exact = re.compile(r"(?i)^\s*log[\s\-]*in\s*$")
+    login_re_sub = re.compile(r"(?i)\blog[\s\-]*in\b")
+    sign_in_re = re.compile(r"(?i)sign\s*in")
+    sign_in_atb_re = re.compile(r"(?i)sign\s*in.*atb")
+
+    return [
+        # === LINK-STYLE — most specific first ===
+        # Anchors pointing to ATB's login domains.
+        lambda f: f.locator("a[href*='login-uat.atb.com']").first,
+        lambda f: f.locator("a[href*='login.atb.com']").first,
+        lambda f: f.locator("a[href*='atb.com']").first,
+        # Anchors with combined "sign in" + "ATB" text (e.g. "Sign in to ATB Personal").
+        lambda f: f.locator("a", has_text=sign_in_atb_re).first,
+        lambda f: f.locator("a", has_text=re.compile(r"(?i)atb\s*(?:login|sign)")).first,
+        # Generic anchors with sign-in / log-in text.
+        lambda f: f.locator("a", has_text=sign_in_re).first,
+        lambda f: f.locator("a", has_text=login_re_sub).first,
+        # Original DEV bot-agent-response wrappers.
+        lambda f: f.locator("span.bot-agent-response p a").first,
+        lambda f: f.locator(".bot-agent-response p a").first,
+        lambda f: f.locator(".bot-agent-response a").first,
+
+        # === CARD-STYLE — "Log In" wording ===
+        lambda f: f.locator('button.tab-focused-btn', has_text=login_re_sub).first,
+        lambda f: f.locator('button', has_text=login_re_sub).first,
+        lambda f: f.locator('div.title', has_text="Login").first,
+        lambda f: f.locator('div.title', has_text="Log In").first,
+        lambda f: f.locator('div.title').filter(has_text=login_re_exact).first,
+        lambda f: f.locator('.card-button, .bot-response-card, .card')
+                   .filter(has_text=login_re_sub).first,
+        lambda f: f.get_by_role("button", name=login_re_exact).first,
+
+        # === CARD-STYLE — "Sign In" wording ===
+        # Same card patterns but matching the alternative button/card label
+        # the bot might use on either environment.
+        lambda f: f.locator('button.tab-focused-btn', has_text=sign_in_re).first,
+        lambda f: f.locator('button', has_text=sign_in_re).first,
+        lambda f: f.locator('div.title', has_text=sign_in_re).first,
+        lambda f: f.locator('.card-button, .bot-response-card, .card')
+                   .filter(has_text=sign_in_re).first,
+        lambda f: f.get_by_role("button", name=sign_in_re).first,
+
+        # === ROLE-BASED FALLBACKS ===
+        lambda f: f.get_by_role("link", name=sign_in_atb_re).first,
+        lambda f: f.get_by_role("link", name=re.compile(r"(?i)atb\s*login")).first,
+        lambda f: f.get_by_role("link", name=sign_in_re).first,
+    ]
+
+
+async def _quick_check_for_login_target(chat_frame, probe_timeout_ms: int = 250):
+    """
+    Single fast sweep through every login-target candidate. Returns the
+    first matching locator, or None if nothing matches within the budget.
+    Uses a short per-candidate probe so the entire sweep finishes in well
+    under a second when no element is present yet.
+    """
+    for build in _login_target_candidates():
+        try:
+            loc = build(chat_frame)
+            await loc.wait_for(state="visible", timeout=probe_timeout_ms)
+            return loc
+        except Exception:
+            continue
+    return None
+
+
+async def wait_for_login_target(
+    chat_frame,
+    timeout_ms: int = 60000,
+    poll_interval_s: float = 2.0,
+):
+    """
+    Continuously poll the chat widget for ANY clickable login element.
+    Each sweep checks every candidate selector with a short probe; between
+    sweeps the loop sleeps poll_interval_s. As soon as a candidate matches
+    we return its locator.
+
+    Polls roughly every poll_interval_s seconds end-to-end. So with the
+    default 2s, a login element that becomes visible at any moment is
+    clicked within ~2-3s, far faster than the original 30+ second effective
+    cadence.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        loc = await _quick_check_for_login_target(chat_frame)
+        if loc is not None:
+            return loc
+        # Don't oversleep — if there's <poll_interval left, sleep just to
+        # the deadline so the final check fires close to the boundary.
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(poll_interval_s, remaining))
+    # One last quick check before raising — the element may have appeared
+    # during the final sleep tick.
+    loc = await _quick_check_for_login_target(chat_frame)
+    if loc is not None:
+        return loc
+    # Timeout — log a snippet of the chat body so the user can see what
+    # text was actually there and extend the selectors if needed.
+    try:
+        tail = (await chat_frame.locator("body").inner_text(timeout=3000))[-600:]
+        tail = tail.replace("\n", " | ").strip()
+        print(f"  [diag] chat frame tail: {tail!r}", file=sys.stderr)
+    except Exception:
+        pass
+    raise RuntimeError(
+        f"Login target (card or link) never appeared in chat widget after "
+        f"polling every {poll_interval_s}s for {timeout_ms / 1000:.0f}s"
+    )
+
+
 async def wait_for_login_link(chat_frame, timeout_ms: int = 60000):
     """
     DEV bot login: the bot replies with a paragraph inside .bot-agent-response
@@ -991,8 +1138,19 @@ async def fetch_otp_from_mailinator(
 
 # ---------- core: full per-query flow ----------
 async def process_query(
-    browser: Browser, query: str, login_id: str, password: str
+    browser: Browser,
+    query: str,
+    login_id: str,
+    password: str,
+    screenshot_label: Optional[str] = None,
 ) -> tuple[str, str]:
+    """
+    Run the full UI flow for one row and return (conversation_id, user_id).
+
+    screenshot_label: optional string included in the failure-screenshot
+                      filename (e.g. f"row{idx+2}_attempt{n}") so multiple
+                      failed attempts on the same row produce distinct files.
+    """
     if not login_id or not password:
         raise RuntimeError(
             "LoginID or Password missing in the workbook for this row — can't run login flow"
@@ -1148,15 +1306,66 @@ async def process_query(
         await wait_for_greeting(chat_frame, timeout_ms=30000)
         await _rand_sleep(0.3, 0.7)
 
-        textarea = await find_textarea(chat_frame, timeout_ms=15000)
-        await human_type(textarea, query)
-        await textarea.press("Enter")
+        # Send the query and continuously poll for the bot's reply (login
+        # card or link). The wait_for_login_target loop polls every
+        # LOGIN_LINK_POLL_INTERVAL_S seconds, so a slow bot reply is caught
+        # within ~2-3s of appearing. If the per-attempt timeout elapses
+        # without a hit, we re-send the query IMMEDIATELY (no extra sleep)
+        # and keep polling — the polling loop itself is the only wait.
+        login_target = None
+        last_login_err: Optional[Exception] = None
+        total_query_attempts = LOGIN_LINK_QUERY_RETRIES + 1
+        for query_attempt in range(1, total_query_attempts + 1):
+            textarea = await find_textarea(chat_frame, timeout_ms=15000)
+            await human_type(textarea, query)
+            await textarea.press("Enter")
+            if query_attempt > 1:
+                print(
+                    f"  [login_wait] re-sent query "
+                    f"(attempt {query_attempt}/{total_query_attempts})",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"  [login_wait] sent query; polling every "
+                    f"{LOGIN_LINK_POLL_INTERVAL_S}s for the login element.",
+                    file=sys.stderr,
+                )
 
-        # Pick the login element waiter based on which bot we're driving.
-        if BOT_ENVIRONMENT == "DEV":
-            login_target = await wait_for_login_link(chat_frame, timeout_ms=60000)
-        else:  # "STAGING"
-            login_target = await wait_for_login_card(chat_frame, timeout_ms=60000)
+            wait_ms = LOGIN_LINK_WAIT_TIMEOUT_S * 1000
+            try:
+                # Unified waiter — handles both card-style and link-style
+                # bot replies, regardless of BOT_ENVIRONMENT. Polls every
+                # LOGIN_LINK_POLL_INTERVAL_S so a late bot response is
+                # picked up quickly without waiting out the full window.
+                login_target = await wait_for_login_target(
+                    chat_frame,
+                    timeout_ms=wait_ms,
+                    poll_interval_s=LOGIN_LINK_POLL_INTERVAL_S,
+                )
+                break  # Got it — exit the retry loop.
+            except Exception as e:
+                last_login_err = e
+                if query_attempt < total_query_attempts:
+                    print(
+                        f"[WARN] [login_wait] login element didn't appear "
+                        f"within {LOGIN_LINK_WAIT_TIMEOUT_S}s on attempt "
+                        f"{query_attempt}/{total_query_attempts}; re-sending "
+                        f"the query immediately and continuing to poll. "
+                        f"Error: {e}",
+                        file=sys.stderr,
+                    )
+                    # No sleep here — the polling resumes inside the next
+                    # wait_for_login_target call right away, so a bot reply
+                    # that lands during the type-and-press window still gets
+                    # caught within poll_interval_s.
+
+        if login_target is None:
+            raise RuntimeError(
+                f"Login link/card never appeared after {total_query_attempts} "
+                f"query attempts (each waiting {LOGIN_LINK_WAIT_TIMEOUT_S}s). "
+                f"Last error: {last_login_err}"
+            )
 
         async with context.expect_page(timeout=15000) as popup_info:
             await human_click(login_target)
@@ -1229,6 +1438,36 @@ async def process_query(
             raise RuntimeError("Captured userId was empty")
         return conv_id, user_id
 
+    except Exception:
+        # Snapshot the page right at the failure point so the user can see
+        # what state the widget was in (modal still up? login form blank?
+        # OTP page stuck loading? etc.). Best-effort — don't let screenshot
+        # errors mask the real exception.
+        if UI_SCREENSHOT_ON_FAILURE:
+            try:
+                screenshot_dir = Path(UI_SCREENSHOT_DIR).resolve()
+                screenshot_dir.mkdir(parents=True, exist_ok=True)
+                ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                ts += f"_{time.time_ns() % 1_000_000:06d}"
+                safe_login = re.sub(r"[^a-zA-Z0-9_-]", "_", login_id or "unknown")
+                label = (
+                    re.sub(r"[^a-zA-Z0-9_-]", "_", screenshot_label)
+                    if screenshot_label else "fail"
+                )
+                fname = f"{label}_{safe_login}_{ts}.png"
+                path = screenshot_dir / fname
+                await page.screenshot(path=str(path), full_page=True)
+                print(
+                    f"[DIAG] saved failure screenshot → {path}",
+                    file=sys.stderr,
+                )
+            except Exception as snap_err:
+                print(
+                    f"[DIAG] couldn't take failure screenshot: {snap_err}",
+                    file=sys.stderr,
+                )
+        raise  # re-raise the original exception so the worker handles it
+
     finally:
         try:
             context.remove_listener("request", _on_request)
@@ -1256,7 +1495,10 @@ async def worker(
         last_err: Optional[Exception] = None
         for attempt in range(1, INNER_RETRIES + 1):
             try:
-                conv_id, user_id = await process_query(browser, query, login_id, password)
+                conv_id, user_id = await process_query(
+                    browser, query, login_id, password,
+                    screenshot_label=f"row{row_index + 2}_attempt{attempt}",
+                )
                 async with lock:
                     while len(rows[row_index]) < NUM_COLUMNS:
                         rows[row_index].append("")
@@ -1275,6 +1517,8 @@ async def worker(
                     file=sys.stderr,
                 )
                 await asyncio.sleep(RETRY_BACKOFF_BASE_S * attempt)
+        # All retries exhausted — write the error to the row so the API
+        # phase will skip it cleanly.
         async with lock:
             while len(rows[row_index]) < NUM_COLUMNS:
                 rows[row_index].append("")

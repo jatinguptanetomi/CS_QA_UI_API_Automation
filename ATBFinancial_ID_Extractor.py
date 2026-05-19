@@ -111,7 +111,7 @@ UI_PHASE_MODE: str = "REFRESH_ALL"
 # This affects DEMO_URL and which login-element waiter is used. When
 # LETS_TALK_MODE is "DEFAULT" (recommended), this also picks the right
 # Let's-talk click behavior (STAGING → NEVER, DEV → ALWAYS).
-BOT_ENVIRONMENT: str = "DEV"
+BOT_ENVIRONMENT: str = "STAGING"
 
 # When True, the script runs STAGING first against TEST_SHEET_STAGING_XLSX,
 # then clears the queries.xlsx D/E columns (so DEV captures fresh IDs),
@@ -566,7 +566,7 @@ async def launch_browser(pw: Playwright) -> Browser:
             "--disable-blink-features=AutomationControlled",
             "--disable-features=IsolateOrigins,site-per-process",
             "--disable-site-isolation-trials",
-            "--no-default-browser-check",
+            "--no-de    fault-browser-check",
             "--no-first-run",
         ]
         if not HEADLESS:
